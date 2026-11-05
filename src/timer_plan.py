@@ -344,6 +344,7 @@ def _charge_timer_cap_pct(
 ) -> int:
     """SA charge stop %: end of this hour's charge window, at least live SOC+5.
 
+    Stop % is also at least back_to_battery_capacity when that setting is set.
     Not hour-end SOC after post-charge discharge, and not overnight reserve.
     Example: Chg 01:00-01:30 peaks at 24.5%, then load drains to 23.6% by 02:00 —
     cap must be 25% (round 24.5), else SA would stop at 24% and end ~23.1%.
@@ -407,6 +408,9 @@ def _charge_timer_cap_pct(
 
     if start_soc is not None:
         cap = max(cap, min(100, int(start_soc) + CHARGE_CAP_MIN_HEADROOM_PCT))
+    back = (cfg.get("inverter") or {}).get("back_to_battery_capacity")
+    if back is not None:
+        cap = max(cap, int(back))
     return min(100, max(min_soc, cap))
 
 

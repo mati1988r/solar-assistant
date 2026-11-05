@@ -17,6 +17,7 @@ from ..config_templates import (
     template_meta_for_api,
     validate_template_name,
 )
+from .. import sa_client
 from ..plan_simulation import hourly_plan_refresh
 from ..simulation_config import normalize_battery_power_limits
 from ..sqlite_store import (
@@ -70,6 +71,11 @@ async def api_get_config() -> dict[str, Any]:
     cfg = load_config()
     cfg.pop("_charge_rate_kw", None)
     cfg.pop("smart_mode_enabled", None)
+    rules = await sa_client.get_rules(cfg, fresh=True)
+    inv = cfg.setdefault("inverter", {})
+    for key in ("to_grid_battery_capacity", "back_to_battery_capacity"):
+        if rules.get(key) is not None:
+            inv[key] = int(rules[key])
     cfg["_template_meta"] = _template_meta_payload()
     return cfg
 
@@ -142,6 +148,24 @@ async def api_save_config(body: dict) -> dict[str, str]:
         body["active_template"] = runtime["active_template"]
     if "plan_overrides" not in body and existing.get("plan_overrides"):
         body["plan_overrides"] = existing["plan_overrides"]
+    inv = body["inverter"]
+    to_grid = int(inv["to_grid_battery_capacity"])
+    back_to = int(inv["back_to_battery_capacity"])
+    if back_to <= to_grid:
+        raise HTTPException(
+            status_code=400,
+            detail="Back to battery capacity must be greater than to grid battery capacity",
+        )
+    inv["to_grid_battery_capacity"] = to_grid
+    inv["back_to_battery_capacity"] = back_to
+    await sa_client._write_metrics(
+        body,
+        [
+            (f"{sa_client._INVERTER_PREFIX}/to_grid_battery_capacity", str(to_grid)),
+            (f"{sa_client._INVERTER_PREFIX}/back_to_battery_capacity", str(back_to)),
+        ],
+    )
+    sa_client.invalidate_rules_cache()
     normalize_battery_power_limits(body)
     save_config(body)
     await _refresh_after_config_change()

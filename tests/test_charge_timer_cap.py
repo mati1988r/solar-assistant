@@ -69,6 +69,13 @@ def test_round_pct_half_up_math_not_bankers():
 # --- _charge_timer_cap_pct unit ---
 
 
+def test_cap_pct_at_least_back_to_battery_capacity():
+    slots = [_q(21.0, battery_delta=1.0, grid_import=1.2)]
+    cfg = _cfg()
+    cfg["inverter"]["back_to_battery_capacity"] = 26
+    assert _charge_timer_cap_pct(slots, cfg) == 26
+
+
 def test_cap_pct_uses_last_charge_quarter_not_hour_end():
     """Live H01: charge to 24.5% by 01:30, then drain to 23.6% — cap is 25%."""
     slots = [

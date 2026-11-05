@@ -337,6 +337,7 @@ def grid_charge_target_soc_kwh_from_step(
     A day with no peak hours on the selected tariff: floor only.
     Peak-day deficit above the floor is scaled by ``GRID_CHARGE_TARGET_HEADROOM``
     so the Chg slot can absorb a heavier evening than the load forecast.
+    On a peak day the target is at least back_to_battery_capacity.
     """
     hour_buys = _day_hour_buys_from_series(
         buy_series,
@@ -362,6 +363,9 @@ def grid_charge_target_soc_kwh_from_step(
     extra = float(target) - float(reserve_floor_kwh)
     if extra > float(epsilon):
         target = float(reserve_floor_kwh) + extra * GRID_CHARGE_TARGET_HEADROOM
+    back = ((cfg or {}).get("inverter") or {}).get("back_to_battery_capacity")
+    if back is not None:
+        target = max(float(target), float(cfg["battery"]["capacity_kwh"]) * float(back) / 100.0)
     return float(target)
 
 

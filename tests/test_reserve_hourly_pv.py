@@ -256,6 +256,37 @@ def test_weekend_grid_charge_target_ignores_overnight_offpeak_load():
     ) == 0.0
 
 
+def test_weekday_grid_charge_target_not_below_back_to_battery():
+    pv = [0.0] * 32 + [0.5] * 4
+    load = [0.2] * len(pv)
+    buy = [OFF] * 24 + [PEAK] * 8 + [PEAK] * 4
+    buy = buy[: len(pv)]
+    cfg = {
+        "battery": {"capacity_kwh": 48.0},
+        "inverter": {"back_to_battery_capacity": 26},
+    }
+    target = grid_charge_target_soc_kwh_from_step(
+        3, pv, load, buy, 1.5, 1.0, 1.0, 0.01, offpeak_buy=OFF,
+        global_step_offset=0, cfg=cfg,
+    )
+    assert target == pytest.approx(48.0 * 0.26)
+
+
+def test_offpeak_day_charge_target_ignores_back_to_battery():
+    pv = [0.0] * 24 + [0.5] * 4
+    load = [0.2] * len(pv)
+    buy = [OFF] * len(pv)
+    cfg = {
+        "battery": {"capacity_kwh": 48.0},
+        "inverter": {"back_to_battery_capacity": 26},
+    }
+    target = grid_charge_target_soc_kwh_from_step(
+        3, pv, load, buy, 1.5, 1.0, 1.0, 0.01, offpeak_buy=OFF,
+        global_step_offset=0, cfg=cfg,
+    )
+    assert target == pytest.approx(1.5)
+
+
 def test_weekday_grid_charge_target_is_peak_deficits_only():
     """Peak-day charge target is floor + morning peak load, not overnight offpeak."""
     pv = [0.0] * 32 + [0.5] * 4

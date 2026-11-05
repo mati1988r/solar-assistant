@@ -112,6 +112,8 @@ def simulation_form_defaults() -> dict[str, float | int]:
         "timer_schedule.min_hourly_transfer_kwh": float(
             DEFAULT_TIMER_SCHEDULE["min_hourly_transfer_kwh"]
         ),
+        "inverter.to_grid_battery_capacity": int(DEFAULT_SIMULATION["min_soc_pct"]),
+        "inverter.back_to_battery_capacity": int(DEFAULT_SIMULATION["min_soc_pct"]) + 2,
         "battery.max_charge_power_kw": float(DEFAULT_BATTERY_MAX_CHARGE_POWER_KW),
         "battery.max_discharge_power_kw": float(DEFAULT_BATTERY_MAX_DISCHARGE_POWER_KW),
     }
@@ -171,8 +173,11 @@ def get_simulation_params(cfg: dict[str, Any]) -> dict[str, float | int]:
     def eta(key: str) -> float:
         return 1.0 - loss_pct(key) / 100.0
 
+    raw = (cfg.get("inverter") or {}).get("to_grid_battery_capacity")
+    min_soc = float(raw if raw is not None else sim["min_soc_pct"])
+
     return {
-        "min_soc_pct": float(sim["min_soc_pct"]),
+        "min_soc_pct": min_soc,
         "horizon_hours": PLAN_HORIZON_HOURS,
         "epsilon_kwh": float(sim["epsilon_kwh"]),
         "eta_grid_battery": eta("grid_to_battery"),
@@ -184,6 +189,7 @@ def get_simulation_params(cfg: dict[str, Any]) -> dict[str, float | int]:
 
 
 def plan_min_soc_pct(cfg: dict[str, Any]) -> float:
+    """Discharge floor percent: inverter to_grid_battery_capacity when set."""
     return float(get_simulation_params(cfg)["min_soc_pct"])
 
 

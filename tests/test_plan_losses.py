@@ -8,6 +8,7 @@ from src.simulation_config import (
     PLAN_HORIZON_HOURS,
     RESERVE_MIN_SOC_MARGIN,
     get_simulation_params,
+    plan_min_soc_kwh,
     plan_min_soc_pct,
     plan_reserve_min_soc_pct,
 )
@@ -172,6 +173,15 @@ def test_reserve_min_soc_margin():
     cfg = _cfg()
     assert plan_min_soc_pct(cfg) == 15.0
     assert plan_reserve_min_soc_pct(cfg) == 15.0 * RESERVE_MIN_SOC_MARGIN
+
+
+def test_plan_min_soc_pct_uses_to_grid_battery_capacity():
+    cfg = _cfg()
+    cfg["simulation"]["min_soc_pct"] = 18
+    cfg["inverter"] = {"to_grid_battery_capacity": 16}
+    assert plan_min_soc_pct(cfg) == 16.0
+    assert get_simulation_params(cfg)["min_soc_pct"] == 16.0
+    assert plan_min_soc_kwh(cfg) == 16.0 / 100.0 * 43.0
 
 
 def test_loss_defaults_single_source():

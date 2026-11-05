@@ -2756,8 +2756,13 @@
         <legend class="text-xs font-semibold text-gray-400 uppercase tracking-wider px-1">Simulation</legend>
         <div class="grid grid-cols-2 gap-4">
           <div>
-            <label class="text-xs text-gray-500 block mb-1">Min SOC (%)</label>
-            <input name="simulation.min_soc_pct" type="number" step="1" min="0" max="50" required value="{{ simulation_form_defaults['simulation.min_soc_pct'] }}"
+            <label class="text-xs text-gray-500 block mb-1">To grid battery capacity (%)</label>
+            <input name="inverter.to_grid_battery_capacity" type="number" step="1" min="1" max="99" required value="{{ simulation_form_defaults['inverter.to_grid_battery_capacity'] }}"
+              class="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 focus:outline-none focus:border-amber-500" />
+          </div>
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">Back to battery capacity (%)</label>
+            <input name="inverter.back_to_battery_capacity" type="number" step="1" min="2" max="100" required value="{{ simulation_form_defaults['inverter.back_to_battery_capacity'] }}"
               class="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 focus:outline-none focus:border-amber-500" />
           </div>
           <div>
@@ -3651,8 +3656,17 @@ function acrPriceYMaxPln() {
 const CHART_G12_BG_OPACITY = 0.32;
 
 function g12PeakPricePln() {
-  const n = Number(configData?.grid?.g12?.peak_price_pln_kwh);
-  return Number.isFinite(n) && n > 0 ? n : 0;
+  const fromCfg = Number(configData?.grid?.g12?.peak_price_pln_kwh);
+  if (Number.isFinite(fromCfg) && fromCfg > 0) return fromCfg;
+  const fromBuy = Number(buyTariffData?.peak_price_pln_kwh);
+  if (Number.isFinite(fromBuy) && fromBuy > 0) return fromBuy;
+  let peak = 0;
+  for (const row of rceData?.g12_hours || []) {
+    if (row.zone !== 'peak') continue;
+    const price = Number(row.buy_price);
+    if (Number.isFinite(price) && price > peak) peak = price;
+  }
+  return peak;
 }
 
 function g12OffpeakPricePln() {
@@ -6128,17 +6142,25 @@ async function saveConfig(event) {
   } else {
     delete updated.active_template;
   }
-  await fetch('api/config', {
+  const res = await fetch('api/config', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(updated),
   });
+  const msg = document.getElementById('cfg-msg');
+  msg.classList.remove('hidden', 'text-green-400', 'text-red-400');
+  if (!res.ok) {
+    const body = await res.json();
+    msg.textContent = body.detail || 'Save failed';
+    msg.classList.add('text-red-400');
+    return;
+  }
   configData = updated;
   simData = null;
   buyTariffData = null;
   forecastData = null;
-  const msg = document.getElementById('cfg-msg');
-  msg.classList.remove('hidden');
+  msg.textContent = 'Configuration saved.';
+  msg.classList.add('text-green-400');
   setTimeout(() => msg.classList.add('hidden'), 3000);
   if (currentTab === 'simulation') void refreshQuarterCycle({ syncSliders: false });
 }
@@ -6461,7 +6483,7 @@ function buildAcrPriceYScale() {
   const maxP = acrPriceYMaxPln();
 
   function priceToBarStyle(price) {
-    if (price == null || price <= 0) {
+    if (price == null || price <= 0 || maxP <= 0) {
       return { bottom: `${baselineBottomPct}%`, height: '0%' };
     }
     const t = Math.min(1, price / maxP);
@@ -6473,7 +6495,7 @@ function buildAcrPriceYScale() {
 
   function priceToPxY(price, height) {
     const p = Number(price);
-    if (!Number.isFinite(p)) {
+    if (!Number.isFinite(p) || maxP <= 0) {
       return height * (1 - baselineBottomPct / 100);
     }
     let fromBottomPct;

@@ -172,6 +172,8 @@ def _empty_rules() -> dict[str, Any]:
         "grid_voltage_1": None,
         "grid_voltage_2": None,
         "grid_voltage_3": None,
+        "to_grid_battery_capacity": None,
+        "back_to_battery_capacity": None,
         "sa_online": False,
     }
 
@@ -414,6 +416,8 @@ async def get_rules(cfg: dict, *, fresh: bool = False) -> dict[str, Any]:
                 grid_voltages[f"grid_voltage_{n}"] = (
                     round(_float(raw), 1) if raw is not None else None
                 )
+            to_grid_raw = by_topic.get(f"{_INVERTER_PREFIX}/to_grid_battery_capacity")
+            back_raw = by_topic.get(f"{_INVERTER_PREFIX}/back_to_battery_capacity")
             result = {
                 "grid_charge_enabled": _truthy(by_topic.get(settings["grid_charge_switch"])),
                 "grid_export_enabled": _truthy(by_topic.get(settings["grid_export_switch"])),
@@ -429,6 +433,8 @@ async def get_rules(cfg: dict, *, fresh: bool = False) -> dict[str, Any]:
                 "solar_power_priority": solar_power_priority,
                 "solar_power_priority_options": _solar_power_priority_options(cfg),
                 **grid_voltages,
+                "to_grid_battery_capacity": None if to_grid_raw is None else int(round(float(to_grid_raw))),
+                "back_to_battery_capacity": None if back_raw is None else int(round(float(back_raw))),
                 "sa_online": True,
             }
             _rules_cache = result
