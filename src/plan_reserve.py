@@ -54,20 +54,7 @@ def morning_cover_bound_from_hour_buys(
     n = min(HOURS_PER_DAY, len(buys))
     if n <= 0:
         return None
-    off = float(offpeak_buy)
-    eps = float(epsilon)
-    is_peak = [float(buys[h]) > off + eps for h in range(n)]
-    blocks: list[tuple[int, int]] = []
-    i = 0
-    while i < n:
-        if not is_peak[i]:
-            i += 1
-            continue
-        j = i + 1
-        while j < n and is_peak[j]:
-            j += 1
-        blocks.append((i, j))
-        i = j
+    blocks = _peak_blocks(_peak_flags(buys[:n], offpeak_buy, epsilon))
     if not blocks:
         return None
     if len(blocks) >= 2:
@@ -331,13 +318,16 @@ def grid_charge_target_soc_kwh_from_step(
     cfg: dict[str, Any] | None = None,
     today_date=None,
 ) -> float:
-    """SOC worth buying from the grid: floor + peak house deficits until PV covers.
+    """SOC worth buying from the grid for the next peak block only.
 
-    Overnight offpeak load is not bought — the house may sit on the grid at night.
-    A day with no peak hours on the selected tariff: floor only.
-    Peak-day deficit above the floor is scaled by ``GRID_CHARGE_TARGET_HEADROOM``
-    so the Chg slot can absorb a heavier evening than the load forecast.
-    On a peak day the target is at least back_to_battery_capacity.
+    The offpeak before 06:00 buys the 06:00–13:00 peak above
+    back_to_battery_capacity: SOC between to-grid and back-to cannot start a
+    discharge, so that morning load sits above back-to.
+    The 13:00–15:00 offpeak buys only through 22:00 and may finish at to-grid.
+    Discharge is already allowed, so a pack that still covers the evening down
+    to to-grid is not topped up.
+    Overnight offpeak load is not bought. A day with no peak hours: floor only.
+    Peak deficit above the chosen floor is scaled by ``GRID_CHARGE_TARGET_HEADROOM``.
     """
     hour_buys = _day_hour_buys_from_series(
         buy_series,
@@ -362,11 +352,77 @@ def grid_charge_target_soc_kwh_from_step(
     )
     extra = float(target) - float(reserve_floor_kwh)
     if extra > float(epsilon):
-        target = float(reserve_floor_kwh) + extra * GRID_CHARGE_TARGET_HEADROOM
+        extra *= GRID_CHARGE_TARGET_HEADROOM
+    else:
+        extra = 0.0
+    floor = float(reserve_floor_kwh)
+    slots_per_day = max(1, slots_per_hour) * HOURS_PER_DAY
+    start_hour = ((global_step_offset + step) % slots_per_day) // max(1, slots_per_hour)
+    day_index = (global_step_offset + step) // slots_per_day
+    tomorrow_flags = _peak_flags(
+        _day_hour_buys_from_series(
+            buy_series, day_index + 1,
+            slots_per_hour=max(1, slots_per_hour),
+            global_step_offset=global_step_offset,
+            offpeak_buy=offpeak_buy,
+            cfg=cfg,
+            today_date=today_date,
+        ),
+        offpeak_buy, epsilon,
+    )
+    served_day, served_end = _served_peak_end(
+        start_hour, _peak_flags(hour_buys, offpeak_buy, epsilon), tomorrow_flags,
+    )
+    blocks = _peak_blocks(_peak_flags(hour_buys, offpeak_buy, epsilon))
+    # First peak of the day (and the next day's first peak) starts from back-to.
+    # A later same-day peak may run down to to-grid.
+    climbs_to_back = served_day != 0 or not blocks or served_end == blocks[0][1]
     back = ((cfg or {}).get("inverter") or {}).get("back_to_battery_capacity")
-    if back is not None:
-        target = max(float(target), float(cfg["battery"]["capacity_kwh"]) * float(back) / 100.0)
-    return float(target)
+    if climbs_to_back and back is not None:
+        back_kwh = float(cfg["battery"]["capacity_kwh"]) * float(back) / 100.0
+        if back_kwh > floor:
+            floor = back_kwh
+    return floor + extra
+
+
+def _peak_flags(hour_buys: list[float], offpeak_buy: float, epsilon: float) -> list[bool]:
+    off = float(offpeak_buy)
+    eps = float(epsilon)
+    return [float(price) > off + eps for price in hour_buys[:HOURS_PER_DAY]]
+
+
+def _peak_blocks(flags: list[bool]) -> list[tuple[int, int]]:
+    blocks: list[tuple[int, int]] = []
+    i = 0
+    while i < len(flags):
+        if not flags[i]:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(flags) and flags[j]:
+            j += 1
+        blocks.append((i, j))
+        i = j
+    return blocks
+
+
+def _served_peak_end(
+    hour: int,
+    today_flags: list[bool],
+    tomorrow_flags: list[bool],
+) -> tuple[int, int]:
+    """Exclusive (day_offset, hour) of the peak block this hour's charge covers.
+
+    A step inside or before a peak serves that peak. After the day's last peak,
+    the charge serves the next day's first peak.
+    """
+    for _start, end in _peak_blocks(today_flags):
+        if end > hour:
+            return 0, end
+    nxt = _peak_blocks(tomorrow_flags)
+    if nxt:
+        return 1, nxt[0][1]
+    return 0, HOURS_PER_DAY
 
 
 def _forward_soc_need_from_step(
@@ -386,12 +442,13 @@ def _forward_soc_need_from_step(
     cfg: dict[str, Any] | None = None,
     today_date=None,
 ) -> float:
-    """Walk forward until PV covers load in that day's tariff morning horizon.
+    """Walk forward until PV covers load, or until the charge's peak block ends.
 
     Cover bound comes from each calendar day's buy prices (morning peak end,
     or evening-peak start, or all-offpeak). Afternoon PV cover must not end
-    the walk before tonight's deficits. With peak_deficits_only, only
-    peak-priced deficits are summed.
+    the reserve walk before tonight's deficits. With peak_deficits_only, only
+    peak-priced deficits are summed, and the walk stops at the end of the peak
+    block this step serves (06:00–13:00, or 15:00–22:00).
     """
     need = 0.0
     j = step + 1
@@ -402,6 +459,34 @@ def _forward_soc_need_from_step(
     off = float(offpeak_buy or 0.0)
     bound_cache: dict[int, int | None] = {}
     seen_insufficient_hour = False
+    served_day_offset = 0
+    served_end_hour = HOURS_PER_DAY
+    if peak_deficits_only:
+        today_flags = _peak_flags(
+            _day_hour_buys_from_series(
+                buy_series, start_day,
+                slots_per_hour=slots_per_hour,
+                global_step_offset=global_step_offset,
+                offpeak_buy=off,
+                cfg=cfg,
+                today_date=today_date,
+            ),
+            off, epsilon,
+        )
+        tomorrow_flags = _peak_flags(
+            _day_hour_buys_from_series(
+                buy_series, start_day + 1,
+                slots_per_hour=slots_per_hour,
+                global_step_offset=global_step_offset,
+                offpeak_buy=off,
+                cfg=cfg,
+                today_date=today_date,
+            ),
+            off, epsilon,
+        )
+        served_day_offset, served_end_hour = _served_peak_end(
+            start_local_hour, today_flags, tomorrow_flags,
+        )
 
     def cover_bound_for_day(day_index: int) -> int | None:
         if day_index not in bound_cache:
@@ -420,6 +505,14 @@ def _forward_soc_need_from_step(
         return bound_cache[day_index]
 
     while j < len(pv_series):
+        if peak_deficits_only:
+            step_day = (global_step_offset + j) // slots_per_day
+            step_hour = ((global_step_offset + j) % slots_per_day) // slots_per_hour
+            day_offset = step_day - start_day
+            if day_offset > served_day_offset or (
+                day_offset == served_day_offset and step_hour >= served_end_hour
+            ):
+                break
         deficit, _ = pv_load_energy_split(
             pv_series[j], load_series[j], eta_pv_load=eta_pv_load,
         )

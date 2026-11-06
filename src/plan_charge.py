@@ -80,17 +80,21 @@ def plan_battery_grid_charge(
     min_block_minutes: int | None = None,
     min_hourly_kwh: float = 0.0,
 ) -> list[HourControl]:
-    """Plan battery grid-charge slots: fill the last offpeak hour(s) before peak.
+    """Plan battery grid-charge slots: fill the last offpeak hour(s) before each peak.
 
     Default: skip the first clock hour of the horizon (current hour) so Chg is
     not placed in the in-progress hour. Pass ``skip_leading_slots=0`` when the
     horizon already starts after a committed current hour (future-only replan).
 
-    Size the AC budget so idle drain until the first peak still leaves
-    ``charge_targets`` at peak start. When targets are at the floor (or unused),
-    relocate the DP pre-peak AC volume instead.
+    Each offpeak run that ends at a peak is packed from the end of that run.
+    The cheap window is the buy-price offpeak before the peak, not a fixed clock hour.
+    Size the AC budget so idle drain until that peak still leaves
+    ``charge_targets`` at peak start. House load on every filled step is on
+    the battery during the fill, so it is bought with the SOC gap.
+    When targets are at the floor (or unused), relocate the DP AC volume
+    of that same offpeak instead.
 
-    Pack at hardware max in the last offpeak clock hour before peak, spilling
+    Pack at hardware max in the last offpeak clock hour before the peak, spilling
     into earlier offpeak hours only if the last hour cannot hold the budget.
     A partial earlier hour is packed at the end of that hour so the charge
     block stays contiguous up to the peak.
@@ -110,40 +114,18 @@ def plan_battery_grid_charge(
     if min_block_minutes is None:
         min_block_minutes = 30
 
-    # Next peak after the current peak block so an evening-peak start still
-    # packs Chg in the last offpeak hour before the following morning peak.
-    scan_from = fill_from_step
-    while scan_from < len(controls):
-        buy_p = float(
-            buy_prices[scan_from] if scan_from < len(buy_prices) else offpeak_buy
-        )
-        if buy_p > offpeak_buy + eps_step:
-            scan_from += 1
-            continue
-        break
-    first_peak = len(controls)
-    peak_buy = float(offpeak_buy)
-    for i in range(scan_from, len(controls)):
-        price = float(buy_prices[i] if i < len(buy_prices) else offpeak_buy)
-        if price > offpeak_buy + eps_step:
-            first_peak = i
-            peak_buy = price
-            break
+    def _price(step: int) -> float:
+        return float(buy_prices[step] if step < len(buy_prices) else offpeak_buy)
 
-    dp_budget_ac = sum(
-        float(controls[i].grid_charge_kw)
-        for i in range(min(first_peak, len(controls)))
-        if float(buy_prices[i] if i < len(buy_prices) else offpeak_buy)
-        <= offpeak_buy + eps_step
-    )
+    def _is_peak(step: int) -> bool:
+        return _price(step) > offpeak_buy + eps_step
 
-    idle_soc = float(initial_soc_kwh)
-    for step in range(min(first_peak, len(controls))):
+    def _play(soc_kwh: float, step: int, ctrl: HourControl):
         pv = float(pv_series[step]) if step < len(pv_series) else 0.0
         load = float(load_series[step]) if step < len(load_series) else 0.0
         reserve = float(reserves[step]) if step < len(reserves) else min_kwh
-        idle_phys = simulate_hour(
-            idle_soc, pv, load, HourControl(0.0, 0.0, False),
+        phys = simulate_hour(
+            soc_kwh, pv, load, ctrl,
             battery_cap=battery_cap,
             min_kwh=min_kwh,
             ac_cap_kw=inverter_ac_step,
@@ -156,119 +138,167 @@ def plan_battery_grid_charge(
             epsilon=eps_step,
             reserve_soc_kwh=reserve,
         )
-        idle_soc = idle_phys.soc_end
+        return phys.soc_end
 
-    prepeak_target = 0.0
-    if charge_targets and first_peak > 0:
-        idx = min(first_peak - 1, len(charge_targets) - 1)
-        if idx >= 0:
-            prepeak_target = float(charge_targets[idx])
-
-    if prepeak_target > min_kwh + eps_step:
-        need_dc = max(0.0, prepeak_target - idle_soc)
-        budget_ac = need_dc / eta_grid if eta_grid > 0 else need_dc
-    else:
-        budget_ac = dp_budget_ac
-
-    if budget_ac > eps_step and not offpeak_min_block_charge_is_worth(
-        need_ac_kwh=budget_ac,
-        min_hourly_kwh=float(min_hourly_kwh),
-        offpeak_buy=float(offpeak_buy),
-        peak_buy=float(peak_buy),
-        eta_grid=float(eta_grid),
-        eta_out=float(eta_out),
-        epsilon=float(eps_step),
-    ):
-        budget_ac = 0.0
-    if budget_ac <= eps_step:
-        out_clear: list[HourControl] = []
-        for step, prev in enumerate(controls):
-            buy_p = float(buy_prices[step]) if step < len(buy_prices) else offpeak_buy
-            clear_chg = (
-                step < first_peak
-                and buy_p <= offpeak_buy + eps_step
-                and float(prev.grid_charge_kw) > eps_step
-            )
-            if clear_chg:
-                out_clear.append(
-                    HourControl(0.0, prev.battery_export_kwh, prev.load_from_grid)
-                )
-            else:
-                out_clear.append(prev)
-        return out_clear
+    # Skip a peak the horizon already sits in, then each offpeak that ends at a peak.
+    scan_from = fill_from_step
+    while scan_from < len(controls) and _is_peak(scan_from):
+        scan_from += 1
+    windows: list[tuple[int, int]] = []
+    i = scan_from
+    while i < len(controls):
+        if _is_peak(i):
+            i += 1
+            continue
+        start = i
+        while i < len(controls) and not _is_peak(i):
+            i += 1
+        if i >= len(controls):
+            break
+        windows.append((start, i))
+        while i < len(controls) and _is_peak(i):
+            i += 1
 
     step_ac = battery_grid_charge_step_ac(
-        budget_ac,
+        charge_ac_step,
         charge_ac_step=charge_ac_step,
         step_scale=step_scale,
         min_block_minutes=int(min_block_minutes),
         eps_step=eps_step,
     )
-
     fill_kw = [0.0] * len(controls)
-    budget_left = float(budget_ac)
-    hour_steps: dict[int, list[int]] = {}
-    for step in range(fill_from_step, min(first_peak, len(controls))):
-        buy_p = float(buy_prices[step]) if step < len(buy_prices) else offpeak_buy
-        if buy_p > offpeak_buy + eps_step:
-            continue
-        hour_steps.setdefault(step // slots_per_hour, []).append(step)
-    hours_desc = sorted(hour_steps.keys(), reverse=True)
-    for hour_i, hour in enumerate(hours_desc):
-        if budget_left <= eps_step:
-            break
-        steps = hour_steps[hour]
-        # The hour nearest the peak keeps a short block at :00. Earlier hours
-        # fill from :45 backward so the leftover meets the next charge hour.
-        if hour_i > 0:
-            steps = list(reversed(steps))
-        for step in steps:
-            if budget_left <= eps_step:
-                break
-            chunk = min(step_ac, charge_ac_step, budget_left)
-            if chunk <= eps_step:
-                continue
-            fill_kw[step] = chunk
-            budget_left = max(0.0, budget_left - chunk)
-
-    out: list[HourControl] = []
+    managed = [False] * len(controls)
     soc = float(initial_soc_kwh)
-    for step, prev in enumerate(controls):
-        pv = float(pv_series[step]) if step < len(pv_series) else 0.0
-        load = float(load_series[step]) if step < len(load_series) else 0.0
-        buy_p = float(buy_prices[step]) if step < len(buy_prices) else offpeak_buy
-        reserve = float(reserves[step]) if step < len(reserves) else min_kwh
-
-        if step >= first_peak:
-            ctrl = HourControl(prev.grid_charge_kw, 0.0, prev.load_from_grid)
-        elif step < fill_from_step:
-            ctrl = HourControl(0.0, 0.0, False)
+    cursor = 0
+    for start, peak in windows:
+        for step in range(cursor, start):
+            prev = controls[step]
+            charge_kw = 0.0 if step < fill_from_step else float(prev.grid_charge_kw)
+            soc = _play(soc, step, HourControl(charge_kw, 0.0, prev.load_from_grid))
+        idle_soc = soc
+        idle_grid: dict[int, float] = {}
+        for step in range(start, peak):
+            pv = float(pv_series[step]) if step < len(pv_series) else 0.0
+            load = float(load_series[step]) if step < len(load_series) else 0.0
+            reserve = float(reserves[step]) if step < len(reserves) else min_kwh
+            idle_phys = simulate_hour(
+                idle_soc, pv, load, HourControl(0.0, 0.0, False),
+                battery_cap=battery_cap,
+                min_kwh=min_kwh,
+                ac_cap_kw=inverter_ac_step,
+                discharge_dc_cap_kwh=discharge_dc_step,
+                eta_grid=eta_grid,
+                eta_out=eta_out,
+                eta_pv_load=eta_pv_load,
+                eta_pv_grid=eta_pv_grid,
+                eta_pv_battery=eta_pv_battery,
+                epsilon=eps_step,
+                reserve_soc_kwh=reserve,
+            )
+            idle_grid[step] = float(idle_phys.grid_import)
+            idle_soc = idle_phys.soc_end
+        prepeak_target = 0.0
+        if charge_targets and peak > 0:
+            idx = min(peak - 1, len(charge_targets) - 1)
+            if idx >= 0:
+                prepeak_target = float(charge_targets[idx])
+        dp_budget_ac = sum(
+            float(controls[step].grid_charge_kw)
+            for step in range(max(start, fill_from_step), peak)
+        )
+        refine_house = prepeak_target > min_kwh + eps_step
+        if refine_house:
+            need_battery = max(0.0, prepeak_target - idle_soc)
+            house_dc = 0.0
+            budget_ac = 0.0
         else:
-            charge_kw = float(fill_kw[step])
+            need_battery = 0.0
+            house_dc = 0.0
+            budget_ac = dp_budget_ac
+        passes = (peak - start + 1) if refine_house else 1
+        for _pass in range(passes):
+            if refine_house:
+                budget_ac = (
+                    (need_battery + house_dc) / eta_grid
+                    if eta_grid > 0
+                    else need_battery + house_dc
+                )
+            for step in range(start, peak):
+                fill_kw[step] = 0.0
+            if budget_ac <= eps_step:
+                break
+            budget_left = float(budget_ac)
+            hour_steps: dict[int, list[int]] = {}
+            for step in range(max(start, fill_from_step), peak):
+                hour_steps.setdefault(step // slots_per_hour, []).append(step)
+            hours_desc = sorted(hour_steps.keys(), reverse=True)
+            for hour_i, hour in enumerate(hours_desc):
+                if budget_left <= eps_step:
+                    break
+                steps = hour_steps[hour]
+                # The hour nearest the peak keeps a short block at :00. Earlier hours
+                # fill from :45 backward so the leftover meets the next charge hour.
+                if hour_i > 0:
+                    steps = list(reversed(steps))
+                for step in steps:
+                    if budget_left <= eps_step:
+                        break
+                    chunk = min(step_ac, charge_ac_step, budget_left)
+                    if chunk <= eps_step:
+                        continue
+                    fill_kw[step] = chunk
+                    budget_left = max(0.0, budget_left - chunk)
+            if not refine_house:
+                break
+            new_house = 0.0
+            for step in range(max(start, fill_from_step), peak):
+                if fill_kw[step] <= eps_step:
+                    continue
+                new_house += float(idle_grid.get(step, 0.0))
+            new_house = new_house / eta_out if eta_out > 0 else new_house
+            if abs(new_house - house_dc) <= eps_step:
+                break
+            house_dc = new_house
+        peak_buy = _price(peak)
+        if budget_ac > eps_step and not offpeak_min_block_charge_is_worth(
+            need_ac_kwh=budget_ac,
+            min_hourly_kwh=float(min_hourly_kwh),
+            offpeak_buy=float(offpeak_buy),
+            peak_buy=float(peak_buy),
+            eta_grid=float(eta_grid),
+            eta_out=float(eta_out),
+            epsilon=float(eps_step),
+        ):
+            budget_ac = 0.0
+            for step in range(start, peak):
+                fill_kw[step] = 0.0
+        for step in range(start, peak):
+            managed[step] = True
+            if budget_ac <= eps_step:
+                fill_kw[step] = 0.0
+        for step in range(start, peak):
+            charge_kw = 0.0 if step < fill_from_step else float(fill_kw[step])
             if charge_kw > eps_step:
                 head_room = max(0.0, battery_cap - soc)
                 max_ac = head_room / eta_grid if eta_grid > 0 else head_room
                 charge_kw = min(charge_kw, max_ac)
                 if charge_kw <= eps_step:
                     charge_kw = 0.0
-            ctrl = HourControl(charge_kw, 0.0, False)
+                fill_kw[step] = charge_kw
+            soc = _play(soc, step, HourControl(charge_kw, 0.0, False))
+        cursor = peak
 
-        phys = simulate_hour(
-            soc, pv, load, ctrl,
-            battery_cap=battery_cap,
-            min_kwh=min_kwh,
-            ac_cap_kw=inverter_ac_step,
-            discharge_dc_cap_kwh=discharge_dc_step,
-            eta_grid=eta_grid,
-            eta_out=eta_out,
-            eta_pv_load=eta_pv_load,
-            eta_pv_grid=eta_pv_grid,
-            eta_pv_battery=eta_pv_battery,
-            epsilon=eps_step,
-            reserve_soc_kwh=reserve,
-        )
+    out: list[HourControl] = []
+    soc = float(initial_soc_kwh)
+    for step, prev in enumerate(controls):
+        if step < fill_from_step:
+            ctrl = HourControl(0.0, 0.0, False)
+        elif managed[step]:
+            ctrl = HourControl(float(fill_kw[step]), 0.0, False)
+        else:
+            ctrl = HourControl(prev.grid_charge_kw, 0.0, prev.load_from_grid)
+        soc = _play(soc, step, ctrl)
         out.append(ctrl)
-        soc = phys.soc_end
     return out
 
 

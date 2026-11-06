@@ -274,7 +274,8 @@ def test_prepeak_budget_covers_overnight_drain_to_peak_target():
     assert out[0].grid_charge_kw < 0.05
     assert all(out[h].grid_charge_kw < 0.05 for h in range(1, 5))
     assert out[5].grid_charge_kw > 0.05
-    assert abs(out[5].grid_charge_kw - 2.4) < 0.05
+    # 2.4 kWh SOC gap plus hour-05 house load, which the fill serves from the battery.
+    assert abs(out[5].grid_charge_kw - 3.4) < 0.05
 
 
 def test_prepeak_pack_skips_leading_peak_then_fills_before_next_peak():

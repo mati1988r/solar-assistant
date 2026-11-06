@@ -269,7 +269,32 @@ def test_weekday_grid_charge_target_not_below_back_to_battery():
         3, pv, load, buy, 1.5, 1.0, 1.0, 0.01, offpeak_buy=OFF,
         global_step_offset=0, cfg=cfg,
     )
-    assert target == pytest.approx(48.0 * 0.26)
+    # 8 peak quarters × 0.2 kWh, then 20% headroom, stacked above 26% SOC.
+    assert target == pytest.approx(48.0 * 0.26 + 1.6 * 1.20)
+
+
+def test_morning_peak_before_pv_sits_above_back_to_battery():
+    """No PV until hour 8: peak load from 6:00 sits above back-to, not inside 18–21%."""
+    cap = 47.6
+    floor = cap * 0.18
+    hourly_pv = [0.0] * 8 + [2.0] * 16
+    hourly_load = [0.6] * 24
+    pv: list[float] = []
+    load: list[float] = []
+    for h in range(24):
+        pv.extend([hourly_pv[h] / 4.0] * 4)
+        load.extend([hourly_load[h] / 4.0] * 4)
+    buy = _q15_buys(_weekday_day_buys())
+    cfg = {
+        "battery": {"capacity_kwh": cap},
+        "inverter": {"back_to_battery_capacity": 21},
+    }
+    target = grid_charge_target_soc_kwh_from_step(
+        5 * 4 + 3, pv, load, buy, floor, 0.925, 0.925, 0.01, offpeak_buy=OFF,
+        cfg=cfg,
+    )
+    morning_dc = (0.6 + 0.6) / 0.925 * 1.20
+    assert target == pytest.approx(cap * 0.21 + morning_dc, abs=0.05)
 
 
 def test_offpeak_day_charge_target_ignores_back_to_battery():
@@ -392,3 +417,49 @@ def test_evening_only_bound_does_not_stop_on_evening_pv_cover():
     )
     # Must walk through night: 19–23 + tomorrow 00 = 24 slots × 0.2
     assert reserve == pytest.approx(floor + 24 * 0.2)
+
+
+def test_afternoon_charge_target_stops_at_22():
+    """13:00–15:00 buys the peak through 22:00, not the next 06:00–13:00."""
+    pv = [0.0] * (48 * 4)
+    load = [0.25] * len(pv)
+    buy = _q15_buys(_weekday_day_buys() + _weekday_day_buys())
+    floor = 2.0
+    target = grid_charge_target_soc_kwh_from_step(
+        14 * 4 + 3, pv, load, buy, floor, 1.0, 1.0, 0.01, offpeak_buy=OFF,
+    )
+    evening = 7 * 1.0
+    assert target == pytest.approx(floor + evening * 1.20)
+
+
+def test_afternoon_top_up_uses_to_grid_not_back_to():
+    """Evening peak may finish at to-grid. back-to is the morning start level."""
+    cap = 47.6
+    pv = [0.0] * (48 * 4)
+    load = [0.25] * len(pv)
+    buy = _q15_buys(_weekday_day_buys() + _weekday_day_buys())
+    cfg = {
+        "battery": {"capacity_kwh": cap},
+        "inverter": {"to_grid_battery_capacity": 16, "back_to_battery_capacity": 26},
+    }
+    floor = cap * 0.16
+    target = grid_charge_target_soc_kwh_from_step(
+        14 * 4 + 3, pv, load, buy, floor, 1.0, 1.0, 0.01, offpeak_buy=OFF,
+        cfg=cfg,
+    )
+    evening = 7 * 1.0
+    assert target == pytest.approx(floor + evening * 1.20)
+    assert target < cap * 0.26 + evening * 1.20
+
+
+def test_pre_6_charge_target_stops_at_13():
+    """Charge before 06:00 buys 06:00–13:00 only, not the 15:00–22:00 peak."""
+    pv = [0.0] * (48 * 4)
+    load = [0.25] * len(pv)
+    buy = _q15_buys(_weekday_day_buys() + _weekday_day_buys())
+    floor = 2.0
+    target = grid_charge_target_soc_kwh_from_step(
+        5 * 4 + 3, pv, load, buy, floor, 1.0, 1.0, 0.01, offpeak_buy=OFF,
+    )
+    morning = 7 * 1.0
+    assert target == pytest.approx(floor + morning * 1.20)

@@ -339,33 +339,18 @@ def _round_pct_half_up(value: float) -> int:
 def _charge_timer_cap_pct(
     slots: list[dict[str, Any]],
     cfg: dict,
-    *,
-    live_soc_pct: float | None = None,
 ) -> int:
-    """SA charge stop %: end of this hour's charge window, at least live SOC+5.
+    """SA charge stop %: SOC this hour's charge window reaches.
 
-    Stop % is also at least back_to_battery_capacity when that setting is set.
-    Not hour-end SOC after post-charge discharge, and not overnight reserve.
+    Half-up round of the last charge quarter. Not the hour-end SOC after a
+    later discharge in the same hour, and not overnight reserve.
     Example: Chg 01:00-01:30 peaks at 24.5%, then load drains to 23.6% by 02:00 —
-    cap must be 25% (round 24.5), else SA would stop at 24% and end ~23.1%.
-    SRNE does not start timed charge when stop % is only 1–2 points above live SOC.
+    cap is 25% (round 24.5). A later hour of the same charge run carries its own stop.
     """
     min_soc = int(plan_min_soc_pct(cfg))
     cap = min_soc
     eps = 0.001
     last_charge_soc: float | None = None
-    start_soc: float | None = None
-    if live_soc_pct is not None:
-        try:
-            start_soc = float(live_soc_pct)
-        except (TypeError, ValueError):
-            start_soc = None
-
-    bat_cap = 0.0
-    try:
-        bat_cap = float((cfg.get("battery") or {}).get("capacity_kwh") or 0)
-    except (TypeError, ValueError):
-        bat_cap = 0.0
 
     for s in slots:
         charged = _slot_bat_charge_kwh(s)
@@ -380,14 +365,9 @@ def _charge_timer_cap_pct(
         if soc is None:
             continue
         try:
-            soc_f = float(soc)
+            last_charge_soc = float(soc)
         except (TypeError, ValueError):
             continue
-        last_charge_soc = soc_f
-        if start_soc is None:
-            start_soc = soc_f
-            if bat_cap > 0:
-                start_soc -= 100.0 * charged / bat_cap
 
     if last_charge_soc is not None:
         cap = min(100, max(min_soc, _round_pct_half_up(last_charge_soc)))
@@ -403,14 +383,7 @@ def _charge_timer_cap_pct(
                 continue
         if last_soc is not None:
             cap = min(100, max(min_soc, _round_pct_half_up(last_soc)))
-            if start_soc is None:
-                start_soc = last_soc
 
-    if start_soc is not None:
-        cap = max(cap, min(100, int(start_soc) + CHARGE_CAP_MIN_HEADROOM_PCT))
-    back = (cfg.get("inverter") or {}).get("back_to_battery_capacity")
-    if back is not None:
-        cap = max(cap, int(back))
     return min(100, max(min_soc, cap))
 
 
@@ -478,17 +451,82 @@ def _hour_timer_segment(
     natural_from = hour_start + first_q * 15
     to_min = hour_start + (last_q + 1) * 15
     from_min = max(natural_from, floor_min)
-    # Extend toward min_block only into the *future* within this hour — never into the past.
-    # Pad a short leftover export window forward to min_block within the hour
-    # (lower kW over a longer span).
+    # Discharge pads a short block forward inside the hour.
+    # Charge that ends on the hour boundary pads backward to min_block so the
+    # block stays against the following charge hour.
     if to_min - from_min < min_block:
         to_min = min(hour_end, from_min + min_block)
+    if (
+        target_action == ACTION_CHARGE_GRID
+        and to_min - from_min < min_block
+    ):
+        from_min = max(floor_min, to_min - min_block)
     if to_min - from_min < min_block:
         return None
 
     duration_min = to_min - from_min
+    cap: int | None = None
     if target_action == ACTION_CHARGE_GRID:
-        power_kw = infer_charge_timer_power_kw(total_kwh, duration_min, cfg)
+        cap = _charge_timer_cap_pct(slots, cfg)
+        bat_cap = float(cfg["battery"]["capacity_kwh"])
+        first = slots[first_q]
+        start_soc = float(first.get("soc_pct") or cap)
+        start_soc -= 100.0 * _slot_bat_charge_kwh(first) / bat_cap
+        # kWh that stays in the battery: the planned store, and at least the
+        # rise from this hour's start to its own cap. House load of the placed
+        # window is added for every charge hour.
+        store_kwh = max(
+            total_kwh,
+            max(0.0, (cap - start_soc) / 100.0 * bat_cap),
+        )
+        max_kw = plan_timer_charge_power_kw(cfg)
+        limit_min = hour_end
+        for qi in range(last_q + 1, len(slots)):
+            later = slots[qi]
+            later_act = str(later.get("action") or "")
+            if "Discharging" in later_act or _slot_bat_discharge_kwh(later) > epsilon:
+                limit_min = hour_start + qi * 15
+                break
+        span_from = from_min
+        span_to = to_min
+        load_kwh = 0.0
+        for _ in range(len(slots) + 1):
+            need_dc = store_kwh + load_kwh
+            packed = min_block
+            if max_kw > 0:
+                packed = max(min_block, int(math.ceil(need_dc / max_kw * 4.0)) * 15)
+            touches_start = span_from <= hour_start
+            touches_end = span_to >= hour_end
+            if touches_start and touches_end:
+                # Charge runs into both neighbouring hours. Keep the span.
+                from_min = span_from
+                to_min = span_to
+            elif touches_end:
+                # Shorten from the start so the block still meets the next hour.
+                duration_min = min(packed, span_to - floor_min)
+                to_min = span_to
+                from_min = to_min - duration_min
+            else:
+                # Shorten from the end so the block still meets the previous hour.
+                duration_min = min(packed, limit_min - span_from)
+                from_min = span_from
+                to_min = from_min + duration_min
+            duration_min = to_min - from_min
+            if duration_min < min_block:
+                return None
+            new_load = 0.0
+            for qi, slot in enumerate(slots):
+                q_from = hour_start + qi * 15
+                q_to = q_from + 15
+                if q_from < to_min and q_to > from_min:
+                    new_load += _slot_load_kwh(slot)
+            if abs(new_load - load_kwh) <= epsilon:
+                load_kwh = new_load
+                break
+            load_kwh = new_load
+        power_kw = infer_charge_timer_power_kw(
+            store_kwh, duration_min, cfg, load_kwh=load_kwh,
+        )
     else:
         power_kw = infer_discharge_timer_power_kw(
             total_kwh,
@@ -505,9 +543,7 @@ def _hour_timer_segment(
         return None
 
     prefix = "Chg" if target_action == ACTION_CHARGE_GRID else "Dis"
-    if target_action == ACTION_CHARGE_GRID:
-        cap = _charge_timer_cap_pct(slots, cfg)
-    else:
+    if target_action != ACTION_CHARGE_GRID:
         # Survive-until-morning floor from the last active Dis quarter.
         last = slots[last_q] if 0 <= last_q < len(slots) else {}
         slot_for_cap = dict(last)
@@ -542,15 +578,60 @@ def _fallback_charge_grid_timer(
     *,
     epsilon: float = 0.001,
 ) -> str:
-    """Full clock-hour charge slot when q15 clip cannot reach SA minimum duration."""
+    """Charge timer when the active quarters cannot grow to min_block forward.
+
+    Keep the planned battery kWh. Duration is min_block, or the full hour when
+    charge already touches both edges. A start-edge block stays on the hour
+    start; any other block stays on the hour end.
+    """
     totals = _hour_slot_totals(slots)
     if totals["bat_charge"] <= epsilon:
         return ""
+    min_block = plan_timer_min_block_minutes(cfg)
+    max_kw = plan_timer_charge_power_kw(cfg)
+    charged_idx = [
+        i for i, slot in enumerate(slots) if _slot_bat_charge_kwh(slot) > epsilon
+    ]
+    touches_start = bool(charged_idx) and charged_idx[0] == 0
+    touches_end = bool(charged_idx) and charged_idx[-1] >= len(slots) - 1
     hour_start = hour * 60
-    power_kw = infer_charge_timer_power_kw(totals["bat_charge"], 60, cfg)
+    hour_end = hour_start + 60
+    load_kwh = 0.0
+    from_min = hour_start
+    to_end = hour_end
+    minutes = min_block
+    for _ in range(len(slots) + 1):
+        gross = totals["bat_charge"] + load_kwh
+        minutes = min_block
+        if max_kw > 0:
+            minutes = max(min_block, int(math.ceil(gross / max_kw * 4.0)) * 15)
+        minutes = min(60, minutes)
+        if touches_start and touches_end:
+            from_min = hour_start
+            to_end = hour_end
+            minutes = 60
+        elif touches_start:
+            from_min = hour_start
+            to_end = from_min + minutes
+        else:
+            to_end = hour_end
+            from_min = to_end - minutes
+        new_load = 0.0
+        for qi, slot in enumerate(slots):
+            q_from = hour_start + qi * 15
+            q_to = q_from + 15
+            if q_from < to_end and q_to > from_min:
+                new_load += _slot_load_kwh(slot)
+        if abs(new_load - load_kwh) <= epsilon:
+            load_kwh = new_load
+            break
+        load_kwh = new_load
+    power_kw = infer_charge_timer_power_kw(
+        totals["bat_charge"], minutes, cfg, load_kwh=load_kwh,
+    )
     cap = _charge_timer_cap_pct(slots, cfg) if slots else 80
     return (
-        f"Chg {_min_to_hhmm(hour_start)}-{_min_to_hhmm(hour_start + 60)} "
+        f"Chg {_min_to_hhmm(from_min)}-{_min_to_hhmm(to_end)} "
         f"{power_kw}kW cap{cap}%"
     )
 
@@ -766,19 +847,22 @@ def infer_charge_timer_power_kw(
     charge_kwh: float,
     duration_min: int,
     cfg: dict,
+    *,
+    load_kwh: float = 0.0,
 ) -> float:
-    """SA timer DC kW from planned battery charge over duration.
+    """SA timer DC kW from battery kWh plus house load over the same window.
 
-    Floors at ``min_hourly_transfer_kwh / duration`` so a Chg block still meets
-    the configured minimum battery transfer (e.g. 2 kWh / 0.5 h → 4 kW).
-    Caps at ``plan_timer_charge_power_kw``. Steps to 0.5 kW like discharge.
+    The charge feeds the house before the remainder enters the battery.
+    Floors at ``min_hourly_transfer_kwh / duration``. Caps at
+    ``plan_timer_charge_power_kw``. Steps to 0.5 kW.
     """
     max_kw = plan_timer_charge_power_kw(cfg)
     min_block = plan_timer_min_block_minutes(cfg)
-    if charge_kwh <= 0.001 or duration_min < min_block:
+    gross_kwh = max(0.0, charge_kwh) + max(0.0, load_kwh)
+    if gross_kwh <= 0.001 or duration_min < min_block:
         return max_kw
     duration_h = duration_min / 60.0
-    needed_dc = charge_kwh / duration_h
+    needed_dc = gross_kwh / duration_h
     min_hourly = plan_timer_min_hourly_transfer_kwh(cfg)
     if min_hourly > 0.001:
         needed_dc = max(needed_dc, min_hourly / duration_h)

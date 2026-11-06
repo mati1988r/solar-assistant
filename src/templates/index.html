@@ -4274,7 +4274,7 @@ function updateSimHistoryChrome(data) {
   if (refreshBtn) {
     refreshBtn.title = past
       ? 'Reload this day from archive / Influx'
-      : 'Refresh plan (quarter cycle)';
+      : 'Recalculate the plan';
   }
   if (!hint) return;
   if (!past) {
@@ -4301,8 +4301,8 @@ async function refreshSimView() {
   try {
     const date = document.getElementById('sim-date')?.value || DEBUG_TODAY;
     if (date === DEBUG_TODAY) {
-      // Same path as a page load: stored plan + meter SOC overlay, no optimizer rebuild.
-      await refreshQuarterCycle({ silent: false, syncSliders: false, force: false });
+      // Recalculate today: GET /api/simulation?refresh=1.
+      await refreshQuarterCycle({ silent: false, syncSliders: false, force: true });
       return;
     }
     await loadSimulationForDate(date, { force: true });
