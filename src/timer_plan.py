@@ -37,6 +37,7 @@ ACTION_TIE_GRID = "Grid Usage for Load"
 ACTION_CHARGE_GRID = "Charging from Grid"
 # SRNE timed charge does not start unless stop % is clearly above live SOC.
 CHARGE_CAP_MIN_HEADROOM_PCT = 5
+_FORBID_APPLIES = ("charge", "discharge", "both")
 ACTION_CHARGE_SOLAR = "Charging from PV"
 ACTION_DISCHARGE_LOAD = "Discharging to Load"
 ACTION_DISCHARGE_GRID = "Discharging to Grid and Load"
@@ -636,6 +637,66 @@ def _fallback_charge_grid_timer(
     )
 
 
+def normalize_timer_forbidden(raw: Any) -> list[dict[str, int | str]]:
+    """Keep forbid rows: clock hours [from, to), applies_to charge, discharge, or both.
+
+    From is included. To is the first hour outside the block. 22–6 covers
+    22:00–06:00. A row with from == to covers no hour.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, int | str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = int(item.get("from_hour"))
+            end = int(item.get("to_hour"))
+        except (TypeError, ValueError):
+            continue
+        applies = str(item.get("applies_to") or "")
+        if applies not in _FORBID_APPLIES:
+            continue
+        if not (0 <= start <= 23 and 0 <= end <= 23) or start == end:
+            continue
+        out.append({"from_hour": start, "to_hour": end, "applies_to": applies})
+    return out
+
+
+def _hour_in_forbid_span(hour: int, start: int, end: int) -> bool:
+    clock = int(hour) % 24
+    if start == end:
+        return False
+    if start < end:
+        return start <= clock < end
+    return clock >= start or clock < end
+
+
+def timer_action_forbidden(cfg: dict, hour: int, action: str) -> bool:
+    """True when this clock hour forbids a grid-charge or battery-export slot.
+
+    *action* is ``charge`` or ``discharge``. A row applies when its
+    ``applies_to`` is that action or ``both``.
+    """
+    rows = (cfg.get("timer_schedule") or {}).get("forbidden") or []
+    if not isinstance(rows, list):
+        return False
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        applies = str(item.get("applies_to") or "")
+        if applies != action and applies != "both":
+            continue
+        try:
+            start = int(item.get("from_hour"))
+            end = int(item.get("to_hour"))
+        except (TypeError, ValueError):
+            continue
+        if _hour_in_forbid_span(hour, start, end):
+            return True
+    return False
+
+
 def build_hour_timer_schedule(
     hour: int,
     slots: list[dict[str, Any]],
@@ -656,6 +717,11 @@ def build_hour_timer_schedule(
         action if action is not None else classify_action(**totals, epsilon=epsilon)
     )
     g_exp = float(grid_export if grid_export is not None else totals["grid_export"])
+    clock_hour = int(hour) % 24
+    if act == ACTION_CHARGE_GRID and timer_action_forbidden(cfg, clock_hour, "charge"):
+        return ""
+    if act == ACTION_DISCHARGE_GRID and timer_action_forbidden(cfg, clock_hour, "discharge"):
+        return ""
     if act == ACTION_CHARGE_GRID:
         bc = float(bat_charge if bat_charge is not None else totals["bat_charge"])
         if bc <= epsilon:

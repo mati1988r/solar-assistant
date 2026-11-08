@@ -208,6 +208,7 @@ def replay_day_plan_with_timer_overrides(
     """
     if not overrides:
         return plan
+    from .plan_q15 import replay_control_without_forbidden
 
     replay_from = max(from_hour, min(overrides.keys()))
     params = get_simulation_params(cfg)
@@ -367,6 +368,7 @@ def replay_day_plan_with_timer_overrides(
                 break
             hh = global_step // Q15_PER_HOUR
             qq = global_step % Q15_PER_HOUR
+            ctrl = replay_control_without_forbidden(ctrl, hh % 24, cfg)
             reserve = reserves[reserve_idx] if reserve_idx < len(reserves) else min_kwh
             phys = simulate_hour(
                 soc, pv_q[global_step], load_q[global_step], ctrl,

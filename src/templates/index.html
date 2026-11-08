@@ -2808,6 +2808,14 @@
               class="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 focus:outline-none focus:border-amber-500" />
           </div>
         </div>
+        <div>
+          <div class="flex items-center justify-between gap-2 mb-2">
+            <p class="text-xs text-gray-500">Forbidden hours</p>
+            <button type="button" id="forbid-ranges-add" onclick="addForbidRange()"
+              class="text-xs font-medium text-amber-700 hover:text-amber-900 shrink-0">+ Add range</button>
+          </div>
+          <div class="space-y-2" id="forbid-ranges"></div>
+        </div>
       </fieldset>
 
       <!-- Buy Tariff -->
@@ -6101,6 +6109,75 @@ function removePvBlock(btn) {
   renderPvBlocks(blocks);
 }
 
+function forbidHourOptions(selected) {
+  const sel = Number(selected);
+  let html = '';
+  for (let h = 0; h < 24; h++) {
+    const label = String(h).padStart(2, '0');
+    html += `<option value="${h}"${h === sel ? ' selected' : ''}>${label}</option>`;
+  }
+  return html;
+}
+
+function getForbidRangesFromDom() {
+  return Array.from(document.querySelectorAll('#forbid-ranges [data-forbid]')).map(row => ({
+    from_hour: parseInt(row.querySelector('[data-forbid-from]')?.value, 10),
+    to_hour: parseInt(row.querySelector('[data-forbid-to]')?.value, 10),
+    applies_to: row.querySelector('[data-forbid-applies]')?.value || 'charge',
+  })).filter(row => Number.isInteger(row.from_hour) && Number.isInteger(row.to_hour) && row.from_hour !== row.to_hour);
+}
+
+function forbidRangeRowHtml(row) {
+  const applies = row?.applies_to || 'charge';
+  const opt = (value, label) => `<option value="${value}"${applies === value ? ' selected' : ''}>${label}</option>`;
+  return `
+    <div class="flex gap-2 items-end bg-gray-100 rounded-lg p-3" data-forbid>
+      <div class="flex-1 grid grid-cols-3 gap-2 min-w-0">
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">From</label>
+          <select data-forbid-from class="w-full bg-white border border-gray-300 rounded px-2 py-1 text-sm text-gray-900">${forbidHourOptions(row?.from_hour ?? 0)}</select>
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">To</label>
+          <select data-forbid-to class="w-full bg-white border border-gray-300 rounded px-2 py-1 text-sm text-gray-900">${forbidHourOptions(row?.to_hour ?? 1)}</select>
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Applies to</label>
+          <select data-forbid-applies class="w-full bg-white border border-gray-300 rounded px-2 py-1 text-sm text-gray-900">
+            ${opt('charge', 'Charge')}
+            ${opt('discharge', 'Discharge')}
+            ${opt('both', 'Both')}
+          </select>
+        </div>
+      </div>
+      <button type="button" onclick="removeForbidRange(this)" aria-label="Remove range"
+        class="px-2 py-1 text-sm text-red-600 hover:text-red-800 hover:bg-red-50 rounded shrink-0">×</button>
+    </div>`;
+}
+
+function renderForbidRanges(rows) {
+  const el = document.getElementById('forbid-ranges');
+  if (!el) return;
+  const list = Array.isArray(rows) ? rows : [];
+  el.innerHTML = list.map(row => forbidRangeRowHtml(row)).join('');
+}
+
+function addForbidRange() {
+  const rows = getForbidRangesFromDom();
+  rows.push({ from_hour: 0, to_hour: 1, applies_to: 'charge' });
+  renderForbidRanges(rows);
+}
+
+function removeForbidRange(btn) {
+  const rows = getForbidRangesFromDom();
+  const row = btn.closest('[data-forbid]');
+  const nodes = [...document.querySelectorAll('#forbid-ranges [data-forbid]')];
+  const idx = nodes.indexOf(row);
+  if (idx < 0) return;
+  rows.splice(idx, 1);
+  renderForbidRanges(rows);
+}
+
 function populateForm(cfg) {
   const SIM_DEFAULTS = {{ simulation_form_defaults | tojson }};
   const form = document.getElementById('cfg-form');
@@ -6110,6 +6187,7 @@ function populateForm(cfg) {
     else if (SIM_DEFAULTS[el.name] !== undefined) el.value = SIM_DEFAULTS[el.name];
   });
   renderPvBlocks(cfg.solar?.blocks);
+  renderForbidRanges(cfg.timer_schedule?.forbidden || []);
   const presetEl = document.getElementById('tariff-preset');
   if (presetEl) presetEl.value = cfg.grid?.g12?.tariff_preset || '';
   const debugTabEl = document.getElementById('debug-tab-enabled');
@@ -6129,6 +6207,8 @@ async function saveConfig(event) {
   });
   if (!updated.solar) updated.solar = {};
   updated.solar.blocks = getPvBlocksFromDom();
+  if (!updated.timer_schedule) updated.timer_schedule = {};
+  updated.timer_schedule.forbidden = getForbidRangesFromDom();
   const presetEl = document.getElementById('tariff-preset');
   const presetKey = presetEl?.value || '';
   if (updated.grid?.g12) {

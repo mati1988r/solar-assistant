@@ -32,6 +32,7 @@ from .timer_plan import (
     build_hour_timer_schedule,
     derive_timer_schedule_q15,
     summarize_hour_actions_debug,
+    timer_action_forbidden,
 )
 
 Q15_PER_HOUR = 4
@@ -192,6 +193,23 @@ def merge_today_hourly_profile(
     return pv, load
 
 
+def replay_control_without_forbidden(ctrl: HourControl, hour: int, cfg: dict) -> HourControl:
+    """Drop a grid-charge or battery-export slot when this clock hour forbids it.
+
+    House load on the battery stays. The EA replay and its Timer Schedule
+    both see the cancelled slot.
+    """
+    charge = float(ctrl.grid_charge_kw)
+    export = float(ctrl.battery_export_kwh)
+    if charge > 0 and timer_action_forbidden(cfg, hour, "charge"):
+        charge = 0.0
+    if export > 0 and timer_action_forbidden(cfg, hour, "discharge"):
+        export = 0.0
+    if charge == float(ctrl.grid_charge_kw) and export == float(ctrl.battery_export_kwh):
+        return ctrl
+    return HourControl(charge, export, bool(ctrl.load_from_grid))
+
+
 def simulate_q15_controls(
     controls: list[HourControl],
     reserves: list[float],
@@ -228,6 +246,7 @@ def simulate_q15_controls(
             continue
         quarter = global_step % Q15_PER_HOUR
         ctrl = controls[step] if step < len(controls) else HourControl(0.0, 0.0)
+        ctrl = replay_control_without_forbidden(ctrl, h % 24, cfg)
 
         phys = simulate_hour(
             soc, pv_q[step], load_q[step], ctrl,
@@ -669,6 +688,7 @@ def run_rolling_smart_q15_plan(
         h = abs_hour % 24
         quarter = global_step % Q15_PER_HOUR
         ctrl = controls[step] if step < len(controls) else HourControl(0.0, 0.0)
+        ctrl = replay_control_without_forbidden(ctrl, h, cfg)
         phys = simulate_hour(
             soc, pv_q[step], load_q[step], ctrl,
             battery_cap=battery_cap,

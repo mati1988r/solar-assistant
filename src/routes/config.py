@@ -20,6 +20,7 @@ from ..config_templates import (
 from .. import sa_client
 from ..plan_simulation import hourly_plan_refresh
 from ..simulation_config import normalize_battery_power_limits
+from ..timer_plan import normalize_timer_forbidden
 from ..sqlite_store import (
     delete_config_template,
     get_installed_default_template,
@@ -167,6 +168,9 @@ async def api_save_config(body: dict) -> dict[str, str]:
     )
     sa_client.invalidate_rules_cache()
     normalize_battery_power_limits(body)
+    ts = body.setdefault("timer_schedule", {})
+    if isinstance(ts, dict):
+        ts["forbidden"] = normalize_timer_forbidden(ts.get("forbidden"))
     save_config(body)
     await _refresh_after_config_change()
     return {"status": "saved"}
