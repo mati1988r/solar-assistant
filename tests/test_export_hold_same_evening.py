@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 from src.plan_optimizer import (
     HourControl,
     BatteryGridExportHourClaim,
@@ -160,12 +162,8 @@ def test_tonight_exports_when_next_evening_in_horizon_is_richer():
     assert exp20 >= 2.0, f"tonight H20 must export, got {exp20} (tomorrow H18={exp_tom18})"
 
 
-def test_leftover_exports_overnight_peak_h06():
-    """01.09 23:00: remaining peak is H06 (0.99 > H23 0.90); leftover Dis H06.
-
-    Tomorrow evening is a later window and must not take tonight's surplus.
-    H23 may also Dis when SOC remains after H06 and overnight house load.
-    """
+def test_morning_peak_skipped_when_later_evening_rates_higher():
+    """01.09 23:00: H06 is 0.99 and tomorrow evening is 1.64. Do not Dis H06."""
     slots = 4
     start_h = 23
     hours = list(range(start_h, start_h + 24))
@@ -235,12 +233,104 @@ def test_leftover_exports_overnight_peak_h06():
     exp06 = hour_export(30)
     exp23 = hour_export(23)
     exp_tom20 = hour_export(44)
-    assert exp06 >= 2.0, (
-        f"overnight peak H06 must export leftover, got H06={exp06} "
-        f"H23={exp23} tomH20={exp_tom20}"
+    assert exp06 < 0.05, (
+        f"morning peak H06 must not export under a richer evening, "
+        f"got H06={exp06} H23={exp23} tomH20={exp_tom20}"
     )
-    if exp23 >= 2.0:
-        assert exp06 >= 2.0
+
+
+def _export_by_hour(controls, offset, steps, slots, abs_hour) -> float:
+    return sum(
+        controls[step].battery_export_kwh
+        for step in range(steps)
+        if (offset + step) // slots == abs_hour
+    )
+
+
+def test_today_morning_peak_yields_to_richer_evening():
+    """2026-11-08: H06 rates 1.09, H16 rates 1.72. Sell the evening, not H06."""
+    slots = 4
+    start_h = 1
+    hours = list(range(start_h, 24))
+    offset = start_h * slots
+    steps = len(hours) * slots
+    prices = {
+        6: 1.0882, 7: 1.0021, 15: 1.4724, 16: 1.719, 17: 1.626,
+        18: 1.6409, 19: 1.6003, 20: 1.5288, 21: 1.3427,
+    }
+    rce: list[float | None] = [None] * (offset + steps)
+    for abs_h in hours:
+        price = prices.get(abs_h, 0.40)
+        for q in range(slots):
+            rce[abs_h * slots + q] = price
+    base = [HourControl(0.0, 0.0, False) for _ in range(steps)]
+    controls = plan_battery_grid_export(
+        base,
+        steps=steps,
+        pv_series=[0.0] * steps,
+        load_series=[0.05] * steps,
+        rce_series=rce,
+        rce_step_offset=offset,
+        step_scale=0.25,
+        initial_soc_kwh=20.0,
+        battery_cap=47.6,
+        min_kwh=7.6,
+        discharge_dc_step=2.0,
+        inverter_ac_step=2.0,
+        eta_grid=0.95,
+        eta_out=0.95,
+        eta_pv_load=0.95,
+        eta_pv_grid=0.95,
+        eta_pv_battery=0.95,
+        eps_step=0.01,
+        reserves=[7.6] * steps,
+        export_floor=0.62,
+        min_hourly_kwh=2.0,
+        cfg=_cfg(),
+        today_date=date(2026, 11, 8),
+    )
+    assert _export_by_hour(controls, offset, steps, slots, 6) < 0.05
+    assert _export_by_hour(controls, offset, steps, slots, 16) >= 2.0
+
+
+def test_morning_peak_exports_when_it_rates_above_the_evening():
+    """H06 at 1.80 still sells when the later evening hour is only 1.20."""
+    slots = 4
+    start_h = 6
+    hours = list(range(start_h, 21))
+    offset = start_h * slots
+    steps = len(hours) * slots
+    prices = {6: 1.80, 16: 1.20}
+    rce: list[float | None] = [None] * (offset + steps)
+    for abs_h in hours:
+        price = prices.get(abs_h, 0.40)
+        for q in range(slots):
+            rce[abs_h * slots + q] = price
+    base = [HourControl(0.0, 0.0, False) for _ in range(steps)]
+    controls = plan_battery_grid_export(
+        base,
+        steps=steps,
+        pv_series=[0.0] * steps,
+        load_series=[0.05] * steps,
+        rce_series=rce,
+        rce_step_offset=offset,
+        step_scale=0.25,
+        initial_soc_kwh=24.0,
+        battery_cap=48.0,
+        min_kwh=8.0,
+        discharge_dc_step=2.0,
+        inverter_ac_step=2.0,
+        eta_grid=0.95,
+        eta_out=0.95,
+        eta_pv_load=0.95,
+        eta_pv_grid=0.95,
+        eta_pv_battery=0.95,
+        eps_step=0.01,
+        reserves=[8.0] * steps,
+        export_floor=0.62,
+        min_hourly_kwh=2.0,
+    )
+    assert _export_by_hour(controls, offset, steps, slots, 6) >= 2.0
 
 
 def test_sale_windows_split_on_noon_gap():

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
+from .g12_pricing import get_g12_zone, g12_peak_windows
 from .grid_config import grid_export_threshold_pln_kwh
 from .plan_physics import (
     HourControl,
@@ -926,9 +928,11 @@ def plan_battery_grid_export(
     hourly avg-RCE (0.01) ≥ *export_floor*. Cover and leftover use the full
     available PV/load and G12 peak/offpeak, not the optimizer hour slice.
     Each start-hour→morning window is filled in clock order so a richer next
-    evening cannot skip tonight. Seed the richest unrounded avg, then the
-    2nd-rated hour (may skip a weaker trough), then grow by 5-groszy rating
-    (ties: closer to the run). A failed ≥-threshold edge closes that side.
+    evening cannot skip tonight. A morning-peak hour is left out when a later
+    hour in the evening window has a higher rating. Seed the richest unrounded
+    avg, then the 2nd-rated hour (may skip a weaker trough), then grow by
+    5-groszy rating (ties: closer to the run). A failed ≥-threshold edge
+    closes that side.
     When SOC cannot cover the run, the last hour shortens from its end and
     a cheaper hour after that tail is not filled in its place.
     """
@@ -978,6 +982,35 @@ def plan_battery_grid_export(
         raw_avgs[int(h)] = float(avg)
         ratings[int(h)] = float(rating)
         grow_ratings[int(h)] = round_rce_5_groszy(avg)
+    # Morning peak stays on the house when a later evening hour rates higher.
+    window_start = int(export_window_start_hour)
+    peak_windows = (
+        g12_peak_windows(cfg) if cfg is not None else [(6, 13), (15, 22)]
+    )
+    day0 = None
+    if today_date is not None:
+        day0 = today_date.date() if isinstance(today_date, datetime) else today_date
+    drop_morning: list[int] = []
+    for h, rating in ratings.items():
+        clock = int(h) % HOURS_PER_DAY
+        if not any(a <= clock < b and a < 12 for a, b in peak_windows):
+            continue
+        if cfg is not None and day0 is not None:
+            day = day0 + timedelta(days=int(h) // HOURS_PER_DAY)
+            zone_dt = datetime(day.year, day.month, day.day, clock)
+            if get_g12_zone(zone_dt, cfg) != "peak":
+                continue
+        if any(
+            int(e) > int(h)
+            and (int(e) % HOURS_PER_DAY) >= window_start
+            and float(ratings[e]) > float(rating) + 1e-12
+            for e in ratings
+        ):
+            drop_morning.append(int(h))
+    for h in drop_morning:
+        ratings.pop(h, None)
+        raw_avgs.pop(h, None)
+        grow_ratings.pop(h, None)
     if not ratings:
         return [
             HourControl(c.grid_charge_kw, 0.0, c.load_from_grid) for c in base_controls
